@@ -1,195 +1,150 @@
 package green365
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
+
+	"github.com/go-resty/resty/v2"
+	"github.com/rs/zerolog/log"
 )
 
 const (
 	BaseURL = "https://api-v2.green365.com.br/api/v2"
 )
 
-// Green365 wraps the Client and provides higher-level operations
-type Green365 struct {
-	client *Client
-}
-
-// NewGreen365 creates a new instance of the central Green365 handler
-func NewGreen365() *Green365 {
-	return &Green365{
-		client: NewClient(),
-	}
-}
-
-// Start authenticates and returns an error if login fails
-func (g *Green365) Start(email, password string) error {
-	return g.client.Login(email, password)
-}
-
-// GetStats returns statistics for the given bot
-func (g *Green365) GetStats(botID string) (*BotStats, error) {
-	return g.client.GetBotStats(botID)
-}
-
-// WatchOpportunities polls for new opportunities and calls the callback for each new item found
-func (g *Green365) WatchOpportunities(botID string, interval time.Duration, callback func(Opportunity)) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		resp, err := g.client.GetOpportunities(botID, 10)
-		if err != nil {
-			fmt.Printf("Error fetching opportunities: %v\n", err)
-			continue
-		}
-
-		for _, item := range resp.Items {
-			callback(item)
-		}
-	}
-	return nil
-}
-
-// Client handles communication with the Green365 API
+// Client handles all communication with the Green365 API.
 type Client struct {
-	BaseURL    string
-	HTTPClient *http.Client
-	Token      string
-	Email      string
-	Password   string
+	baseURL  string
+	resty    *resty.Client
+	email    string
+	password string
 }
 
-// NewClient creates a new Green365 client
+// NewClient initializes a new Green365 API client.
 func NewClient() *Client {
+	r := resty.New().
+		SetBaseURL(BaseURL).
+		SetTimeout(10 * time.Second).
+		SetHeader("Content-Type", "application/json")
+
 	return &Client{
-		BaseURL: BaseURL,
-		HTTPClient: &http.Client{
-			Timeout: time.Second * 10,
-		},
+		baseURL: BaseURL,
+		resty:   r,
 	}
 }
 
-// Login authenticates with the API and stores the Bearer token
-func (c *Client) Login(email, password string) error {
-	url := fmt.Sprintf("%s/auth/login", c.BaseURL)
+// Authenticate logs in to the API and stores the credentials for automatic re-authentication.
+func (c *Client) Authenticate(email, password string) error {
+	c.email = email
+	c.password = password
+	return c.login()
+}
 
-	c.Email = email
-	c.Password = password
+func (c *Client) login() error {
+	log.Info().Str("email", c.email).Msg("Attempting to authenticate with Green365")
 
-	reqBody, _ := json.Marshal(LoginRequest{
-		Email:    email,
-		Password: password,
-	})
+	var result LoginResponse
+	resp, err := c.resty.R().
+		SetBody(LoginRequest{
+			Email:    c.email,
+			Password: c.password,
+		}).
+		SetResult(&result).
+		Post("/auth/login")
 
-	resp, err := c.HTTPClient.Post(url, "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return fmt.Errorf("login request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("login failed with status: %s", resp.Status)
+		return fmt.Errorf("authentication request failed: %w", err)
 	}
 
-	var loginResp LoginResponse
-	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
-		return fmt.Errorf("failed to decode login response: %w", err)
+	if resp.IsError() {
+		return fmt.Errorf("authentication failed with status %d: %s", resp.StatusCode(), resp.String())
 	}
 
-	c.Token = loginResp.Token
+	// Set the token for all future requests
+	c.resty.SetAuthToken(result.Token)
+	log.Debug().Msg("Authentication successful, token updated")
 	return nil
 }
 
-// doRequest handles making HTTP requests with automatic re-login on 403
-func (c *Client) doRequest(method, url string, body io.Reader) (*http.Response, error) {
-	makeReq := func() (*http.Request, error) {
-		req, err := http.NewRequest(method, url, body)
-		if err != nil {
-			return nil, err
-		}
-		if c.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+c.Token)
-		}
-		return req, nil
-	}
-
-	req, err := makeReq()
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	// If 403, try to re-login and retry once
-	if resp.StatusCode == http.StatusForbidden && c.Email != "" && c.Password != "" {
-		resp.Body.Close()
-		fmt.Println("Received 403 Forbidden. Attempting to re-login...")
-
-		if err := c.Login(c.Email, c.Password); err != nil {
-			return nil, fmt.Errorf("re-login failed after 403: %w", err)
-		}
-
-		// Re-create request for retry (in case body needs to be reset, though nil here)
-		req, err = makeReq()
-		if err != nil {
-			return nil, err
-		}
-
-		return c.HTTPClient.Do(req)
-	}
-
-	return resp, nil
-}
-
-// GetBotStats retrieves statistics for a specific bot
+// GetBotStats retrieves statistics for the specified bot.
 func (c *Client) GetBotStats(botID string) (*BotStats, error) {
-	url := fmt.Sprintf("%s/bots/%s/stats", c.BaseURL, botID)
-
-	resp, err := c.doRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("stats request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("stats failed with status: %s", resp.Status)
-	}
-
 	var stats BotStats
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		return nil, fmt.Errorf("failed to decode stats: %w", err)
+	err := c.execute("GET", fmt.Sprintf("/bots/%s/stats", botID), nil, &stats)
+	if err != nil {
+		return nil, err
 	}
-
 	return &stats, nil
 }
 
-// GetOpportunities retrieves the latest opportunities for a specific bot
+// GetOpportunities retrieves the latest opportunities for the specified bot.
 func (c *Client) GetOpportunities(botID string, limit int) (*OpportunitiesResponse, error) {
-	url := fmt.Sprintf("%s/bots/%s/opportunities?limit=%d", c.BaseURL, botID, limit)
-
-	resp, err := c.doRequest("GET", url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("opportunities request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		fmt.Printf("Debug - Ops error body: %s\n", string(bodyBytes))
-		return nil, fmt.Errorf("opportunities failed with status: %s", resp.Status)
-	}
-
 	var oppResp OpportunitiesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&oppResp); err != nil {
-		return nil, fmt.Errorf("failed to decode opportunities: %w", err)
+	err := c.execute("GET", fmt.Sprintf("/bots/%s/opportunities", botID), map[string]string{
+		"limit": fmt.Sprintf("%d", limit),
+	}, &oppResp)
+	if err != nil {
+		return nil, err
+	}
+	return &oppResp, nil
+}
+
+// WatchOpportunities starts a polling loop to watch for new bot opportunities.
+// It is a blocking call that respects the provided context.
+func (c *Client) WatchOpportunities(ctx context.Context, botID string, interval time.Duration, callback func(Opportunity)) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			resp, err := c.GetOpportunities(botID, 10)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to fetch opportunities")
+				continue
+			}
+
+			for _, item := range resp.Items {
+				callback(item)
+			}
+		}
+	}
+}
+
+// execute performs an HTTP request with automatic re-authentication if a 403 Forbidden is encountered.
+func (c *Client) execute(method, path string, queryParams map[string]string, result interface{}) error {
+	run := func() (*resty.Response, error) {
+		return c.resty.R().
+			SetQueryParams(queryParams).
+			SetResult(result).
+			Execute(method, path)
 	}
 
-	return &oppResp, nil
+	resp, err := run()
+	if err != nil {
+		return fmt.Errorf("request %s %s failed: %w", method, path, err)
+	}
+
+	// Handle 403 by re-logging once and retrying
+	if resp.StatusCode() == http.StatusForbidden && c.email != "" {
+		log.Warn().Msg("Received 403 Forbidden. Attempting to re-authenticate...")
+		if err := c.login(); err != nil {
+			return fmt.Errorf("automatic re-authentication failed: %w", err)
+		}
+
+		// Retry the request
+		resp, err = run()
+		if err != nil {
+			return fmt.Errorf("retry %s %s failed: %w", method, path, err)
+		}
+	}
+
+	if resp.IsError() {
+		return fmt.Errorf("request %s %s failed with status %d: %s", method, path, resp.StatusCode(), resp.String())
+	}
+
+	return nil
 }
